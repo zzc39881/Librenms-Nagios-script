@@ -1,0 +1,196 @@
+#!/usr/bin/env bash
+
+set -u
+
+DOMAIN=""
+EXPECTED=""
+DNS_SERVER=""
+TIMEOUT=5
+CHECK_RESOLVE=1
+ALLOW_EXTRA=0
+
+print_help() {
+    cat <<'EOF'
+Usage:
+  check_domain_mx -d <domain> [options]
+
+Options:
+  -d, --domain              Domain to check
+  -e, --expected            Expected records:
+                            priority:host,priority:host
+  -s, --server              DNS server
+  -t, --timeout             Timeout per dig query, default 5 seconds
+  --allow-extra             Allow MX records outside the expected list
+  --no-resolve-check        Skip A/AAAA resolution check for MX targets
+  -h, --help                Show help
+EOF
+}
+
+unknown() {
+    echo "UNKNOWN - $1"
+    exit 3
+}
+
+normalize_host() {
+    local host="$1"
+    host="${host,,}"
+    host="${host%.}"
+    printf '%s' "$host"
+}
+
+require_value() {
+    local option="$1"
+    local value="${2:-}"
+    [[ -n "$value" && "$value" != -* ]] || unknown "參數 $option 缺少值"
+}
+
+[[ $# -gt 0 ]] || unknown "未輸入參數，請使用 -h 查看說明"
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -d|--domain)
+            require_value "$1" "${2:-}"
+            DOMAIN="$2"
+            shift 2
+            ;;
+        -e|--expected)
+            require_value "$1" "${2:-}"
+            EXPECTED="$2"
+            shift 2
+            ;;
+        -s|--server)
+            require_value "$1" "${2:-}"
+            DNS_SERVER="$2"
+            shift 2
+            ;;
+        -t|--timeout)
+            require_value "$1" "${2:-}"
+            TIMEOUT="$2"
+            shift 2
+            ;;
+        --allow-extra)
+            ALLOW_EXTRA=1
+            shift
+            ;;
+        --no-resolve-check)
+            CHECK_RESOLVE=0
+            shift
+            ;;
+        -h|--help)
+            print_help
+            exit 0
+            ;;
+        *)
+            shift
+            ;;
+    esac
+done
+
+[[ -n "$DOMAIN" ]] || unknown "缺少網域參數 -d"
+[[ "$DOMAIN" =~ ^[A-Za-z0-9.-]+$ ]] || unknown "網域格式無效：$DOMAIN"
+[[ "$TIMEOUT" =~ ^[0-9]+$ ]] || unknown "Timeout 必須是正整數"
+((TIMEOUT > 0)) || unknown "Timeout 必須大於 0"
+command -v dig >/dev/null 2>&1 || unknown "找不到 dig，請安裝 dnsutils"
+
+DOMAIN=$(normalize_host "$DOMAIN")
+
+dig_args=("+time=${TIMEOUT}" "+tries=1" "+short" "MX" "$DOMAIN")
+[[ -n "$DNS_SERVER" ]] && dig_args+=("@${DNS_SERVER}")
+
+mx_output=$(dig "${dig_args[@]}" 2>&1)
+dig_exit=$?
+
+if ((dig_exit != 0)); then
+    echo "CRITICAL - $DOMAIN MX 查詢失敗：$mx_output"
+    exit 2
+fi
+
+mapfile -t actual_records < <(
+    printf '%s\n' "$mx_output" |
+    awk 'NF >= 2 {print $1, $2}' |
+    while read -r priority host; do
+        host=$(normalize_host "$host")
+        printf '%s:%s\n' "$priority" "$host"
+    done |
+    sort -u
+)
+
+if (( ${#actual_records[@]} == 0 )); then
+    echo "CRITICAL - $DOMAIN 找不到 MX 記錄"
+    exit 2
+fi
+
+missing_records=()
+unexpected_records=()
+unresolved_hosts=()
+
+if [[ -n "$EXPECTED" ]]; then
+    IFS=',' read -ra expected_input <<< "$EXPECTED"
+    expected_records=()
+
+    for item in "${expected_input[@]}"; do
+        item="${item//[[:space:]]/}"
+        [[ "$item" =~ ^([0-9]+):([A-Za-z0-9.-]+)\.?$ ]] || unknown "預期 MX 格式錯誤：$item"
+        expected_records+=("${BASH_REMATCH[1]}:$(normalize_host "${BASH_REMATCH[2]}")")
+    done
+
+    mapfile -t expected_records < <(printf '%s\n' "${expected_records[@]}" | sort -u)
+
+    for expected_record in "${expected_records[@]}"; do
+        found=0
+        for actual_record in "${actual_records[@]}"; do
+            [[ "$expected_record" == "$actual_record" ]] && found=1 && break
+        done
+        ((found == 1)) || missing_records+=("$expected_record")
+    done
+
+    if ((ALLOW_EXTRA == 0)); then
+        for actual_record in "${actual_records[@]}"; do
+            found=0
+            for expected_record in "${expected_records[@]}"; do
+                [[ "$actual_record" == "$expected_record" ]] && found=1 && break
+            done
+            ((found == 1)) || unexpected_records+=("$actual_record")
+        done
+    fi
+fi
+
+if ((CHECK_RESOLVE == 1)); then
+    for record in "${actual_records[@]}"; do
+        host="${record#*:}"
+        [[ "$host" == "." || -z "$host" ]] && continue
+
+        resolve_args=("+time=${TIMEOUT}" "+tries=1" "+short" "$host")
+        [[ -n "$DNS_SERVER" ]] && resolve_args+=("@${DNS_SERVER}")
+
+        a_result=$(dig "${resolve_args[@]}" A 2>/dev/null)
+        aaaa_result=$(dig "${resolve_args[@]}" AAAA 2>/dev/null)
+
+        if [[ -z "$a_result" && -z "$aaaa_result" ]]; then
+            unresolved_hosts+=("$host")
+        fi
+    done
+fi
+
+actual_display=$(IFS=', '; echo "${actual_records[*]}")
+
+if (( ${#missing_records[@]} > 0 )); then
+    missing_display=$(IFS=', '; echo "${missing_records[*]}")
+    echo "CRITICAL - $DOMAIN 缺少預期 MX：$missing_display；目前：$actual_display"
+    exit 2
+fi
+
+if (( ${#unexpected_records[@]} > 0 )); then
+    unexpected_display=$(IFS=', '; echo "${unexpected_records[*]}")
+    echo "CRITICAL - $DOMAIN 出現非預期 MX：$unexpected_display；目前：$actual_display"
+    exit 2
+fi
+
+if (( ${#unresolved_hosts[@]} > 0 )); then
+    unresolved_display=$(IFS=', '; echo "${unresolved_hosts[*]}")
+    echo "CRITICAL - $DOMAIN MX 目標無法解析：$unresolved_display"
+    exit 2
+fi
+
+echo "OK - $DOMAIN MX 記錄正常：$actual_display"
+exit 0

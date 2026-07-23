@@ -1,0 +1,217 @@
+#!/usr/bin/env bash
+
+set -u
+
+DEFAULT_WARNING=30
+DEFAULT_CRITICAL=7
+RDAP_BASE_URL="https://rdap.org/domain"
+CONNECT_TIMEOUT=10
+TOTAL_TIMEOUT=40
+CACHE_TTL=86400
+STALE_CACHE_MAX_AGE=604800
+CACHE_DIR="/var/cache/librenms/check_domain_rdap"
+
+warning="$DEFAULT_WARNING"
+critical="$DEFAULT_CRITICAL"
+domain=""
+original_args="$*"
+
+print_help() {
+    cat <<'EOF'
+Usage:
+  check_domain_rdap -d <domain> [-w <warning_days>] [-c <critical_days>]
+
+Options:
+  -d, --domain      Domain name, for example example.com
+  -w, --warning     Warning threshold in remaining days, default 30
+  -c, --critical    Critical threshold in remaining days, default 7
+  -h, --help        Show help
+EOF
+}
+
+unknown() {
+    echo "UNKNOWN - $1"
+    exit 3
+}
+
+require_value() {
+    local option="$1"
+    local value="${2:-}"
+    [[ -n "$value" && "$value" != -* ]] || unknown "參數 $option 缺少值"
+}
+
+get_file_age() {
+    local file="$1"
+    local now modified
+    now=$(date +%s)
+    modified=$(stat -c %Y "$file" 2>/dev/null) || return 1
+    echo $((now - modified))
+}
+
+validate_rdap_json() {
+    local file="$1"
+    jq -e '
+        type == "object"
+        and (.errorCode? == null)
+        and ([
+            .events[]?
+            | select(
+                ((.eventAction // "") | ascii_downcase) == "expiration"
+                or ((.eventAction // "") | ascii_downcase) == "registration expiration"
+            )
+            | .eventDate
+        ] | length > 0)
+    ' "$file" >/dev/null 2>&1
+}
+
+[[ $# -gt 0 ]] || unknown "未輸入任何參數，請使用 -h 查看說明"
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help)
+            print_help
+            exit 0
+            ;;
+        -d|--domain)
+            require_value "$1" "${2:-}"
+            domain="$2"
+            shift 2
+            ;;
+        -w|--warning)
+            require_value "$1" "${2:-}"
+            warning="$2"
+            shift 2
+            ;;
+        -c|--critical)
+            require_value "$1" "${2:-}"
+            critical="$2"
+            shift 2
+            ;;
+        *)
+            shift
+            ;;
+    esac
+done
+
+[[ -n "$domain" ]] || unknown "缺少網域參數 -d，收到參數：$original_args"
+[[ "$warning" =~ ^[0-9]+$ ]] || unknown "Warning 必須是非負整數，目前值：$warning"
+[[ "$critical" =~ ^[0-9]+$ ]] || unknown "Critical 必須是非負整數，目前值：$critical"
+((warning > critical)) || unknown "Warning 必須大於 Critical，目前為 warning=$warning critical=$critical"
+[[ "$domain" =~ ^[A-Za-z0-9.-]+$ ]] || unknown "網域格式無效：$domain"
+
+domain="${domain,,}"
+domain="${domain%.}"
+
+for command_name in curl jq date stat flock mktemp; do
+    command -v "$command_name" >/dev/null 2>&1 || unknown "找不到必要指令：$command_name"
+done
+
+[[ -d "$CACHE_DIR" ]] || unknown "快取目錄不存在：$CACHE_DIR，請由 root 預先建立"
+[[ -r "$CACHE_DIR" && -w "$CACHE_DIR" && -x "$CACHE_DIR" ]] || \
+    unknown "快取目錄權限不足：$CACHE_DIR，執行帳號=$(id -un)"
+
+safe_domain=$(printf '%s' "$domain" | tr -c 'A-Za-z0-9._-' '_')
+cache_file="${CACHE_DIR}/${safe_domain}.json"
+lock_file="${CACHE_DIR}/${safe_domain}.lock"
+temp_file=""
+curl_error_file=""
+
+cleanup() {
+    [[ -n "$temp_file" ]] && rm -f "$temp_file"
+    [[ -n "$curl_error_file" ]] && rm -f "$curl_error_file"
+}
+trap cleanup EXIT
+
+exec 9>"$lock_file"
+flock -w 15 9 || unknown "等待網域快取鎖逾時：$domain"
+
+response_file=""
+
+if [[ -s "$cache_file" ]]; then
+    cache_age=$(get_file_age "$cache_file" || echo "$STALE_CACHE_MAX_AGE")
+    if ((cache_age < CACHE_TTL)) && validate_rdap_json "$cache_file"; then
+        response_file="$cache_file"
+    fi
+fi
+
+if [[ -z "$response_file" ]]; then
+    temp_file=$(mktemp "${CACHE_DIR}/${safe_domain}.tmp.XXXXXX")
+    curl_error_file=$(mktemp "${CACHE_DIR}/${safe_domain}.curl.XXXXXX")
+
+    curl \
+        --silent \
+        --show-error \
+        --location \
+        --ipv4 \
+        --fail-with-body \
+        --connect-timeout "$CONNECT_TIMEOUT" \
+        --max-time "$TOTAL_TIMEOUT" \
+        --retry 2 \
+        --retry-delay 3 \
+        --retry-all-errors \
+        --header "Accept: application/rdap+json, application/json" \
+        --user-agent "LibreNMS-RDAP-Monitor/1.0" \
+        "${RDAP_BASE_URL}/${domain}" \
+        >"$temp_file" 2>"$curl_error_file"
+    curl_exit=$?
+
+    if ((curl_exit == 0)) && validate_rdap_json "$temp_file"; then
+        mv -f "$temp_file" "$cache_file"
+        temp_file=""
+        response_file="$cache_file"
+    else
+        curl_error=$(tr '\n' ' ' <"$curl_error_file")
+
+        if [[ -s "$cache_file" ]]; then
+            cache_age=$(get_file_age "$cache_file" || echo "$STALE_CACHE_MAX_AGE")
+            if ((cache_age <= STALE_CACHE_MAX_AGE)) && validate_rdap_json "$cache_file"; then
+                response_file="$cache_file"
+            fi
+        fi
+
+        if [[ -z "$response_file" ]]; then
+            if ((curl_exit == 22)) && grep -q '429' <<<"$curl_error"; then
+                unknown "網域查詢被限流（HTTP 429），且沒有可用資料：$domain"
+            fi
+            unknown "網域查詢失敗，curl exit=$curl_exit：${curl_error:-無詳細錯誤}"
+        fi
+    fi
+fi
+
+expiration_date=$(jq -r '
+    [
+        .events[]?
+        | select(
+            ((.eventAction // "") | ascii_downcase) == "expiration"
+            or ((.eventAction // "") | ascii_downcase) == "registration expiration"
+        )
+        | .eventDate
+    ][0] // empty
+' "$response_file")
+
+[[ -n "$expiration_date" ]] || unknown "回應中找不到網域到期日期"
+exp_ts=$(date -d "$expiration_date" +%s 2>/dev/null) || unknown "無法解析到期日期：$expiration_date"
+cur_ts=$(date +%s)
+diff_seconds=$((exp_ts - cur_ts))
+
+display_date=$(TZ=Asia/Taipei date -d "$expiration_date" '+%Y-%m-%d %H:%M:%S UTC+8' 2>/dev/null) || \
+    unknown "無法將到期日期轉換為台灣時間：$expiration_date"
+
+if ((diff_seconds < 0)); then
+    expired_days=$(((-diff_seconds + 86399) / 86400))
+    echo "CRITICAL - $domain 已過期 $expired_days 天，到期時間：$display_date"
+    exit 2
+fi
+
+days=$(((diff_seconds + 86399) / 86400))
+
+if ((days <= critical)); then
+    echo "CRITICAL - $domain 剩餘 $days 天，到期時間：$display_date"
+    exit 2
+elif ((days <= warning)); then
+    echo "WARNING - $domain 剩餘 $days 天，到期時間：$display_date"
+    exit 1
+else
+    echo "OK - $domain 剩餘 $days 天，到期時間：$display_date"
+    exit 0
+fi
