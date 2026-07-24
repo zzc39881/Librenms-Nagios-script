@@ -52,6 +52,32 @@ sudo -u librenms \
   -c 7
 ```
 
+### 實際執行範例
+
+以下結果於 2026-07-24 在 Ubuntu 22.04 實際執行取得：
+
+```bash
+sudo -u librenms \
+  /usr/lib/nagios/plugins/check_domain_rdap \
+  -d example.com \
+  -w 30 \
+  -c 7
+```
+
+輸出：
+
+```text
+WARNING - example.com 剩餘 20 天，到期時間：2026-08-13 12:00:00 UTC+8
+```
+
+Exit code：
+
+```text
+1
+```
+
+此例的剩餘天數為 20 天，低於或等於 Warning 門檻 30 天、但高於 Critical 門檻 7 天，因此回傳 `WARNING`。實際輸出會依執行日期及 RDAP 回傳的網域資料而變動。
+
 LibreNMS Service Parameters：
 
 ```text
