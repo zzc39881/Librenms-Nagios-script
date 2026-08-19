@@ -5,11 +5,12 @@ set -u
 DEFAULT_WARNING=30
 DEFAULT_CRITICAL=7
 RDAP_BASE_URL="https://rdap.org/domain"
+CO_WHOIS_SERVER="whois.registry.co"
 CONNECT_TIMEOUT=10
 TOTAL_TIMEOUT=40
 CACHE_TTL=86400
 STALE_CACHE_MAX_AGE=604800
-CACHE_DIR="/var/cache/librenms/check_domain_rdap"
+CACHE_DIR="${RDAP_CACHE_DIR:-/var/cache/librenms/check_domain_rdap}"
 
 warning="$DEFAULT_WARNING"
 critical="$DEFAULT_CRITICAL"
@@ -138,22 +139,49 @@ if [[ -z "$response_file" ]]; then
     temp_file=$(mktemp "${CACHE_DIR}/${safe_domain}.tmp.XXXXXX")
     curl_error_file=$(mktemp "${CACHE_DIR}/${safe_domain}.curl.XXXXXX")
 
-    curl \
-        --silent \
-        --show-error \
-        --location \
-        --ipv4 \
-        --fail-with-body \
-        --connect-timeout "$CONNECT_TIMEOUT" \
-        --max-time "$TOTAL_TIMEOUT" \
-        --retry 2 \
-        --retry-delay 3 \
-        --retry-all-errors \
-        --header "Accept: application/rdap+json, application/json" \
-        --user-agent "LibreNMS-RDAP-Monitor/1.0" \
-        "${RDAP_BASE_URL}/${domain}" \
-        >"$temp_file" 2>"$curl_error_file"
-    curl_exit=$?
+    if [[ "$domain" == *.co ]]; then
+        for command_name in timeout whois; do
+            command -v "$command_name" >/dev/null 2>&1 || \
+                unknown ".co lookup requires command: $command_name"
+        done
+
+        timeout "${TOTAL_TIMEOUT}s" \
+            whois -h "$CO_WHOIS_SERVER" "domain $domain" \
+            >"$temp_file" 2>"$curl_error_file"
+        curl_exit=$?
+
+        if ((curl_exit == 0)); then
+            whois_expiration=$(sed -n '/^Registry Expiry Date:/ { s/^Registry Expiry Date:[[:space:]]*//; p; q; }' "$temp_file")
+            whois_expiration="${whois_expiration%$'\r'}"
+
+            if [[ "$whois_expiration" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]+)?Z$ ]] &&
+                date -d "$whois_expiration" +%s >/dev/null 2>&1; then
+                printf '{"events":[{"eventAction":"expiration","eventDate":"%s"}]}\n' \
+                    "$whois_expiration" >"$temp_file"
+            else
+                printf 'WHOIS response does not contain a valid Registry Expiry Date\n' \
+                    >"$curl_error_file"
+                curl_exit=1
+            fi
+        fi
+    else
+        curl \
+            --silent \
+            --show-error \
+            --location \
+            --ipv4 \
+            --fail-with-body \
+            --connect-timeout "$CONNECT_TIMEOUT" \
+            --max-time "$TOTAL_TIMEOUT" \
+            --retry 2 \
+            --retry-delay 3 \
+            --retry-all-errors \
+            --header "Accept: application/rdap+json, application/json" \
+            --user-agent "LibreNMS-RDAP-Monitor/1.0" \
+            "${RDAP_BASE_URL}/${domain}" \
+            >"$temp_file" 2>"$curl_error_file"
+        curl_exit=$?
+    fi
 
     if ((curl_exit == 0)) && validate_rdap_json "$temp_file"; then
         mv -f "$temp_file" "$cache_file"
@@ -170,6 +198,9 @@ if [[ -z "$response_file" ]]; then
         fi
 
         if [[ -z "$response_file" ]]; then
+            if [[ "$domain" == *.co ]]; then
+                unknown ".co WHOIS lookup failed, exit=$curl_exit: ${curl_error:-no details}"
+            fi
             if ((curl_exit == 22)) && grep -q '429' <<<"$curl_error"; then
                 unknown "網域查詢被限流（HTTP 429），且沒有可用資料：$domain"
             fi
