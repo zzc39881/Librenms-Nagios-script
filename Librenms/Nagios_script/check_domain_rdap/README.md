@@ -21,7 +21,7 @@ check_domain_rdap
 
 ```bash
 sudo apt update
-sudo apt install curl jq util-linux
+sudo apt install curl jq util-linux whois
 ```
 
 複製腳本：
